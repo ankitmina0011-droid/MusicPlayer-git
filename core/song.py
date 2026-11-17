@@ -16,6 +16,7 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>
 """
 
+import sys
 import json
 import asyncio
 from shlex import quote
@@ -55,15 +56,23 @@ class Song:
             return (True, "ALREADY_PARSED")
         if self._retries >= 5:
             return (False, "MAX_RETRY_LIMIT_REACHED")
+        # sys.executable -m yt_dlp uses the same Python environment as the bot,
+        # so it works even if the yt-dlp command is not in PATH.
         process = await asyncio.create_subprocess_shell(
-            f"yt-dlp --print-json --skip-download -f best {quote(self.source)}",
+            f"{quote(sys.executable)} -m yt_dlp --print-json --skip-download "
+            f"-f best {quote(self.source)}",
             stdout=PIPE,
             stderr=PIPE,
         )
-        out, _ = await process.communicate()
+        out, err = await process.communicate()
         try:
             video = json.loads(out.decode())
         except json.JSONDecodeError:
+            # Show the real reason in the console so it can be fixed.
+            print(
+                f"[yt-dlp] failed for {self.source!r} (attempt {self._retries + 1}):\n"
+                f"{err.decode(errors='ignore')[-800:]}"
+            )
             self._retries += 1
             return await self.parse()
         check_remote = await self.check_remote_url(video["url"], video["http_headers"])
@@ -79,6 +88,10 @@ class Song:
             self.parsed = True
             return (True, "PARSED")
         else:
+            print(
+                f"[yt-dlp] link check failed for {self.source!r} "
+                f"(remote ok: {check_remote}, thumbnail ok: {check_thumb})"
+            )
             self._retries += 1
             return await self.parse()
 
