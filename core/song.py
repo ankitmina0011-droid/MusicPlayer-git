@@ -21,11 +21,13 @@ import json
 import asyncio
 from shlex import quote
 from subprocess import PIPE
-from urllib.parse import urlparse
 from datetime import timedelta
+from urllib.parse import urlparse
 from aiohttp import ClientSession
 from pyrogram.types import User, Message
 from typing import Dict, Tuple, Union, Optional
+
+DEFAULT_THUMB = "https://telegra.ph/file/820cac7cb7b1a025542e2.jpg"
 
 
 class Song:
@@ -46,7 +48,7 @@ class Song:
             self._retries: int = 0
             self.duration: str = "N/A"
             self.headers: dict = None
-            self.thumb: str = "https://telegra.ph/file/820cac7cb7b1a025542e2.jpg"
+            self.thumb: str = DEFAULT_THUMB
             for key, value in link.items():
                 setattr(self, key, value)
             self.request_msg: Message = request_msg
@@ -55,57 +57,81 @@ class Song:
     async def parse(self) -> Tuple[bool, str]:
         if self.parsed:
             return (True, "ALREADY_PARSED")
-        if self._retries >= 5:
-            return (False, "MAX_RETRY_LIMIT_REACHED")
+
+        source = self.source
+        is_search_text = "://" not in source and not source.startswith(
+            ("ytsearch", "scsearch")
+        )
+
+        # 1) Try the source itself (YouTube, SoundCloud, direct link, ...).
+        video = None
+        if not is_search_text:
+            video = await self._extract(source)
+            if video and await self._playable(video):
+                await self._fill(video)
+                return (True, "PARSED")
+
+        # 2) The source did not work (for example YouTube answers 403 on this
+        #    host). Fall back to SoundCloud, searching by the song name.
+        if "soundcloud.com" not in source:
+            query = source if is_search_text else (video or {}).get("title")
+            if query:
+                print(f"[fallback] trying SoundCloud for {query!r}")
+                sc_video = await self._extract(f"scsearch1:{query}")
+                if sc_video and await self._playable(sc_video):
+                    await self._fill(sc_video)
+                    return (True, "PARSED")
+
+        self._retries += 1
+        return (False, "MAX_RETRY_LIMIT_REACHED")
+
+    async def _extract(self, target: str) -> Optional[dict]:
         # sys.executable -m yt_dlp uses the same Python environment as the bot,
         # so it works even if the yt-dlp command is not in PATH.
         process = await asyncio.create_subprocess_shell(
             f"{quote(sys.executable)} -m yt_dlp --print-json --skip-download "
-            f"-f best {quote(self.source)}",
+            f"-f best {quote(target)}",
             stdout=PIPE,
             stderr=PIPE,
         )
         out, err = await process.communicate()
-        try:
-            video = json.loads(out.decode())
-        except json.JSONDecodeError:
-            # Show the real reason in the console so it can be fixed.
-            print(
-                f"[yt-dlp] failed for {self.source!r} (attempt {self._retries + 1}):\n"
-                f"{err.decode(errors='ignore')[-800:]}"
-            )
-            self._retries += 1
-            return await self.parse()
-        check_remote = await self.check_remote_url(video["url"], video["http_headers"])
-        check_thumb = await self.check_remote_url(
-            video["thumbnail"], video["http_headers"]
-        )
-        if check_remote and check_thumb:
-            self.title = self._escape(video["title"])
-            self.duration = str(timedelta(seconds=video["duration"]))
-            self.thumb = video["thumbnail"]
-            self.remote = video["url"]
-            self.headers = video["http_headers"]
-            self.parsed = True
-            return (True, "PARSED")
-        else:
-            print(
-                f"[yt-dlp] link check failed for {self.source!r} "
-                f"(remote ok: {check_remote}, thumbnail ok: {check_thumb})"
-            )
-            self._retries += 1
-            return await self.parse()
+        for line in out.decode(errors="ignore").splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError:
+                    break
+        print(f"[yt-dlp] failed for {target!r}:\n{err.decode(errors='ignore')[-800:]}")
+        return None
+
+    async def _playable(self, video: dict) -> bool:
+        url = video.get("url")
+        if not url:
+            return False
+        return await self.check_remote_url(url, video.get("http_headers"))
+
+    async def _fill(self, video: dict) -> None:
+        headers = video.get("http_headers")
+        thumb = video.get("thumbnail")
+        if not (thumb and await self.check_remote_url(thumb, headers)):
+            thumb = DEFAULT_THUMB
+        self.title = self._escape(video.get("title") or "Unknown")
+        self.duration = str(timedelta(seconds=int(video.get("duration") or 0)))
+        self.thumb = thumb
+        self.remote = video["url"]
+        self.headers = headers
+        self.parsed = True
 
     @staticmethod
     async def check_remote_url(
         path: str, headers: Optional[Dict[str, str]] = None
     ) -> bool:
         host = urlparse(path).netloc
+        session = ClientSession()
         try:
-            session = ClientSession()
             response = await session.get(path, timeout=15, headers=headers)
             response.close()
-            await session.close()
             if response.status in (200, 206):
                 return True
             print(f"[check] {host} answered with status {response.status}")
@@ -113,6 +139,8 @@ class Song:
         except BaseException as e:
             print(f"[check] request to {host} failed: {type(e).__name__}: {e}")
             return False
+        finally:
+            await session.close()
 
     @staticmethod
     def _escape(_title: str) -> str:
