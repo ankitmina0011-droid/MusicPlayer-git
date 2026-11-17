@@ -39,7 +39,7 @@ from core import (
 REPO = """
 🤖 **Music Player**
 
-- Repo: [GitHub](https://github.com/AsmSafone/MusicPlayer)
+- Repo: [GitHub](https://github.com/ankitmina558-cyber/MusicPlayer-git)
 - License: AGPL-3.0-or-later
 """
 
@@ -82,7 +82,7 @@ async def help(_, message: Message, lang):
     await message.reply_text(lang["helpText"].replace("<prefix>", config.PREFIXES[0]))
 
 
-@client.on_message(filters.command(["p", "play"], config.PREFIXES) & ~filters.private)
+@client.on_message(filters.command(["p", "play", "vp", "vplay"], config.PREFIXES) & ~filters.private)
 @register
 @language
 @handle_error
@@ -94,6 +94,9 @@ async def play_stream(_, message: Message, lang):
         if not check:
             k = await message.reply_text(lang["notAllowed"])
             return await delete_messages([message, k])
+    if message.command[0].lower() in ("vp", "vplay"):
+        set_group(chat_id, stream_mode="video")
+        group = get_group(chat_id)
     song = await search(message)
     if song is None:
         k = await message.reply_text(lang["notFound"])
