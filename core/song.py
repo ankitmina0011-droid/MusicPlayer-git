@@ -21,6 +21,7 @@ import json
 import asyncio
 from shlex import quote
 from subprocess import PIPE
+from urllib.parse import urlparse
 from datetime import timedelta
 from aiohttp import ClientSession
 from pyrogram.types import User, Message
@@ -99,16 +100,18 @@ class Song:
     async def check_remote_url(
         path: str, headers: Optional[Dict[str, str]] = None
     ) -> bool:
+        host = urlparse(path).netloc
         try:
             session = ClientSession()
-            response = await session.get(path, timeout=5, headers=headers)
+            response = await session.get(path, timeout=15, headers=headers)
             response.close()
             await session.close()
-            if response.status == 200:
+            if response.status in (200, 206):
                 return True
-            else:
-                return False
-        except BaseException:
+            print(f"[check] {host} answered with status {response.status}")
+            return False
+        except BaseException as e:
+            print(f"[check] request to {host} failed: {type(e).__name__}: {e}")
             return False
 
     @staticmethod
