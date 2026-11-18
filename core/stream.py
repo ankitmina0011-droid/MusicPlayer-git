@@ -109,6 +109,15 @@ async def _probe(song: Song) -> Tuple[bool, str]:
 async def _download_local(song: Song) -> Optional[str]:
     """Download the song to the server and return the file path."""
     os.makedirs("downloads", exist_ok=True)
+    # Remove copies older than an hour so the disk does not fill up.
+    now = time.time()
+    for name in os.listdir("downloads"):
+        old = os.path.join("downloads", name)
+        try:
+            if now - os.path.getmtime(old) > 3600:
+                os.remove(old)
+        except OSError:
+            pass
     template = os.path.join("downloads", f"{time.time_ns()}.%(ext)s")
     url = getattr(song, "page_url", None) or song.source
     process = await asyncio.create_subprocess_shell(
@@ -136,16 +145,19 @@ async def start_stream(song: Song, lang):
     infomsg = await song.request_msg.reply_text(lang["downloading"])
     _t0 = time.time()
     print(f"[stream] starting {song.title!r} in chat {chat.id}")
-    # Streams in HLS (m3u8) form are the ones ffmpeg often cannot read directly.
-    if "m3u8" in (getattr(song, "protocol", "") or ""):
-        ok, info = await _probe(song)
-        print(f"[probe] ffmpeg {'ok' if ok else 'FAILED: ' + info}")
-        if not ok:
-            local = await _download_local(song)
-            if local:
-                print(f"[probe] playing the downloaded copy: {local}")
-                song.remote = local
-                song.headers = None
+    # HLS (m3u8) streams, like SoundCloud's, start very slowly when read live.
+    # Download the song first and play the local file instead.
+    if "m3u8" in (getattr(song, "protocol", "") or "") and not os.path.exists(
+        song.remote
+    ):
+        _d0 = time.time()
+        local = await _download_local(song)
+        if local:
+            print(f"[download] saved in {time.time() - _d0:.1f}s: {local}")
+            song.remote = local
+            song.headers = None
+        else:
+            print("[download] failed, playing the live stream instead")
     try:
         await pytgcalls.play(
             chat.id,
@@ -255,4 +267,4 @@ def get_quality(song: Song) -> MediaStream:
                 AudioQuality.HIGH,
                 video_flags=MediaStream.Flags.IGNORE,
                 headers=song.headers,
-            )
+    )
