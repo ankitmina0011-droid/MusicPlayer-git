@@ -18,10 +18,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>
 
 import os
 import json
+import time
 import shutil
 from config import config
 from core.song import Song
 from core import ui
+from core.stream import forget_call, _SWITCHING
 from lang import load
 from pyrogram import enums
 from pyrogram.types import Message, CallbackQuery
@@ -119,6 +121,26 @@ async def play_stream(_, message: Message, lang):
             pass
 
 
+async def _find_song(message: Message):
+    """Find the song for /play without the slow YouTube search.
+
+    A plain name goes straight to SoundCloud (see core/song.py). Links, replied
+    audio files and Spotify links keep the old handling in core/funcs.py.
+    """
+    reply = message.reply_to_message
+    if reply and not reply.text and reply.media:
+        return await search(message)
+    query = (reply.text if reply else extract_args(message.text)) or ""
+    if query == "":
+        return None
+    is_yt_url, url = check_yt_url(query)
+    if is_yt_url:
+        return Song(url, message)
+    if "open.spotify.com" in query:
+        return await search(message)
+    return Song(query, message)
+
+
 async def _play_flow(message: Message, lang, busy):
     chat_id = message.chat.id
     group = get_group(chat_id)
@@ -130,18 +152,20 @@ async def _play_flow(message: Message, lang, busy):
     if message.command[0].lower() in ("vp", "vplay"):
         set_group(chat_id, stream_mode="video")
         group = get_group(chat_id)
-    song = await search(message)
+    song = await _find_song(message)
     if song is None:
         k = await message.reply_text(lang["notFound"])
         return await delete_messages([message, k])
-    ok, status = await song.parse()
-    if not ok:
-        raise Exception(status)
     if not group["is_playing"]:
+        # The voice chat is joined while the song downloads (see start_stream).
         set_group(chat_id, is_playing=True, now_playing=song)
         await start_stream(song, lang, busy)
         await delete_messages([message])
     else:
+        ok, status = await song.parse()
+        if not ok:
+            k = await message.reply_text(lang["notFound"])
+            return await delete_messages([message, k])
         queue = get_queue(chat_id)
         await queue.put(song)
         k = await message.reply_text(
@@ -188,7 +212,8 @@ async def live_stream(_, message: Message, lang):
             )
     ok, status = await song.parse()
     if not ok:
-        raise Exception(status)
+        k = await message.reply_text(lang["notFound"])
+        return await delete_messages([message, k])
     if not group["is_playing"]:
         set_group(chat_id, is_playing=True, now_playing=song)
         await start_stream(song, lang)
@@ -211,7 +236,7 @@ async def live_stream(_, message: Message, lang):
 @only_admins
 @handle_error
 async def skip_track(_, message: Message, lang):
-    await _play_next(message.chat.id, lang)
+    await _play_next(message.chat.id, lang, skipped=True)
     await delete_messages([message])
 
 
@@ -291,6 +316,7 @@ async def leave_vc(_, message: Message, lang):
     set_group(chat_id, is_playing=False, now_playing=None)
     await set_title(message, "")
     clear_queue(chat_id)
+    forget_call(chat_id)
     try:
         await pytgcalls.leave_call(chat_id)
         k = await message.reply_text(lang["leaveVC"])
@@ -478,9 +504,6 @@ async def import_queue(_, message: Message, lang):
     else:
         song = temp_queue[0]
         set_group(chat_id, is_playing=True, now_playing=song)
-        ok, status = await song.parse()
-        if not ok:
-            raise Exception(status)
         await start_stream(song, lang)
         for _song in temp_queue[1:]:
             await queue.put(_song)
@@ -529,15 +552,15 @@ async def import_playlist(_, message: Message, lang):
         return await delete_messages([message, k])
     queue = get_queue(chat_id)
     if not group["is_playing"]:
-        song = await temp_queue.__anext__()
+        try:
+            song = await temp_queue.__anext__()
+        except StopAsyncIteration:
+            k = await message.reply_text(lang["notFound"])
+            return await delete_messages([message, k])
         set_group(chat_id, is_playing=True, now_playing=song)
-        ok, status = await song.parse()
-        if not ok:
-            raise Exception(status)
         await start_stream(song, lang)
         async for _song in temp_queue:
             await queue.put(_song)
-        queue.get_nowait()
     else:
         async for _song in temp_queue:
             await queue.put(_song)
@@ -567,19 +590,17 @@ async def update_restart(_, message: Message, lang):
     os.system(f"kill -9 {os.getpid()} && bash startup.sh")
 
 
-async def _play_next(chat_id: int, lang) -> None:
-    """Play the next song: repeat, the queue, autoplay, or leave the call."""
+async def _play_next(chat_id: int, lang, skipped: bool = False) -> None:
+    """Play the next song: repeat, the queue, autoplay, or leave the call.
+
+    A skip moves on even when loop is on. A song that ends repeats."""
     group = get_group(chat_id)
-    if group["loop"]:
+    if group["loop"] and not skipped and group["now_playing"] is not None:
         await start_stream(group["now_playing"], lang)
         return
     queue = get_queue(chat_id)
     if len(queue) > 0:
         next_song = await queue.get()
-        if not next_song.parsed:
-            ok, status = await next_song.parse()
-            if not ok:
-                raise Exception(status)
         set_group(chat_id, now_playing=next_song)
         await start_stream(next_song, lang)
         return
@@ -594,13 +615,10 @@ async def _play_next(chat_id: int, lang) -> None:
         set_group(chat_id, now_playing=next_song)
         await start_stream(next_song, lang)
         return
-    if safone.get(chat_id) is not None:
-        try:
-            await safone[chat_id].delete()
-        except BaseException:
-            pass
+    # The song card stays in the chat. Only the close button removes it.
     await set_title(chat_id, "", client=app)
     set_group(chat_id, is_playing=False, now_playing=None)
+    forget_call(chat_id)
     try:
         await pytgcalls.leave_call(chat_id)
     except (NoActiveGroupCall, NotInCallError):
@@ -668,12 +686,13 @@ async def player_buttons(_, query: CallbackQuery):
             await _answer(query, lang["loopMode"] % ("Enabled" if enabled else "Disabled"))
         elif action == "skip":
             await _answer(query, "⏭ Skipping")
-            await _play_next(chat_id, lang)
+            await _play_next(chat_id, lang, skipped=True)
         elif action == "stop":
             set_group(chat_id, is_playing=False, now_playing=None)
             clear_queue(chat_id)
             await set_title(chat_id, "", client=app)
             await _answer(query, "⏹ Stopped")
+            forget_call(chat_id)
             await pytgcalls.leave_call(chat_id)
         else:
             await _answer(query)
@@ -697,20 +716,27 @@ async def help_button(_, query: CallbackQuery):
 @language
 @handle_error
 async def stream_end(_, update: Update, lang):
-    if isinstance(update, StreamEnded):
-        await _play_next(update.chat_id, lang)
+    if not isinstance(update, StreamEnded):
+        return
+    chat_id = update.chat_id
+    group = get_group(chat_id)
+    # Ignore an end that is not a real song end: no song is playing, the stream
+    # is being switched right now, or the song only just started (the silence
+    # or the old stream being replaced can report an end at that moment).
+    if not group["is_playing"] or chat_id in _SWITCHING:
+        return
+    if time.time() - (group.get("stream_started_at") or 0) < 2:
+        return
+    await _play_next(chat_id, lang)
 
 
 @pytgcalls.on_update(fl.chat_update(ChatUpdate.Status.LEFT_CALL))
 @handle_error
 async def closed_vc(_, update: Update):
     chat_id = update.chat_id
-    if chat_id not in all_groups():
-        if safone.get(chat_id) is not None:
-            try:
-                await safone[chat_id].delete()
-            except BaseException:
-                pass
+    # The music account is out of this voice chat, however it ended.
+    forget_call(chat_id)
+    if chat_id in all_groups():
         await set_title(chat_id, "", client=app)
         set_group(chat_id, now_playing=None, is_playing=False)
         clear_queue(chat_id)
