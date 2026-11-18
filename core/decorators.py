@@ -29,6 +29,8 @@ from pytgcalls.types import Update
 from typing import Union, Callable
 from core.groups import get_group, all_groups, set_default
 
+_ME_ID = None
+
 
 def register(func: Callable) -> Callable:
     async def decorator(client: Client, message: Message, *args):
@@ -93,9 +95,13 @@ def handle_error(func: Callable) -> Callable:
         elif isinstance(obj, Update):
             chat_id = obj.chat_id
 
-        me = await pyro_client.get_me()
-        if me.id not in config.SUDOERS:
-            config.SUDOERS.append(me.id)
+        # get_me() calls users.GetFullUser, which Telegram rate-limits (FloodWait).
+        # Ask once and remember the answer instead of on every command/update.
+        global _ME_ID
+        if _ME_ID is None:
+            _ME_ID = (await pyro_client.get_me()).id
+        if _ME_ID not in config.SUDOERS:
+            config.SUDOERS.append(_ME_ID)
         try:
             lang = get_group(chat_id)["lang"]
         except BaseException:
