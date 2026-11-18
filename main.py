@@ -92,6 +92,18 @@ async def help(_, message: Message, lang):
 @language
 @handle_error
 async def play_stream(_, message: Message, lang):
+    # Reply at once, before any searching, so the user sees the bot respond.
+    busy = await message.reply_text(lang["downloading"])
+    try:
+        return await _play_flow(message, lang, busy)
+    finally:
+        try:
+            await busy.delete()
+        except BaseException:
+            pass
+
+
+async def _play_flow(message: Message, lang, busy):
     chat_id = message.chat.id
     group = get_group(chat_id)
     if group["admins_only"]:
@@ -111,7 +123,7 @@ async def play_stream(_, message: Message, lang):
         raise Exception(status)
     if not group["is_playing"]:
         set_group(chat_id, is_playing=True, now_playing=song)
-        await start_stream(song, lang)
+        await start_stream(song, lang, busy)
         await delete_messages([message])
     else:
         queue = get_queue(chat_id)
