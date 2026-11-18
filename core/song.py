@@ -29,6 +29,7 @@ from aiohttp import ClientSession
 from pyrogram.types import User, Message
 from typing import Dict, List, Tuple, Union, Optional
 
+AUDIO_FORMAT = "bestaudio[protocol!=m3u8_native][protocol!=m3u8]/bestaudio/best"
 DEFAULT_THUMB = "https://telegra.ph/file/820cac7cb7b1a025542e2.jpg"
 
 
@@ -168,7 +169,7 @@ class Song:
         # -i keeps going when one result fails (for example DRM protected).
         process = await asyncio.create_subprocess_shell(
             f"{quote(sys.executable)} -m yt_dlp -i --no-warnings --print-json "
-            f"--skip-download -f best {quote(target)}",
+            f"--skip-download -f {quote(AUDIO_FORMAT)} {quote(target)}",
             stdout=PIPE,
             stderr=PIPE,
         )
