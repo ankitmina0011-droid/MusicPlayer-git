@@ -16,21 +16,120 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>
 """
 
+import os
 import re
-import sys
 import time
-import json
+import shutil
 import asyncio
-from shlex import quote
-from subprocess import PIPE
-from datetime import timedelta
+from typing import Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
+
 from aiohttp import ClientSession
 from pyrogram.types import User, Message
-from typing import Dict, List, Tuple, Union, Optional
+from yt_dlp import YoutubeDL
 
+DOWNLOAD_DIR = os.path.abspath("downloads")
+DOWNLOAD_MAX_AGE = 3 * 60 * 60  # seconds, older song folders are deleted
+# Audio only. Progressive files are preferred because they download in one go.
 AUDIO_FORMAT = "bestaudio[protocol!=m3u8_native][protocol!=m3u8]/bestaudio/best"
 DEFAULT_THUMB = "https://telegra.ph/file/820cac7cb7b1a025542e2.jpg"
+FETCH_TIMEOUT = 60  # seconds for one search + download
+
+
+def _format_duration(seconds) -> str:
+    try:
+        total = int(float(seconds or 0))
+    except (TypeError, ValueError):
+        return "N/A"
+    if total <= 0:
+        return "N/A"
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def _cleanup_downloads() -> None:
+    if not os.path.isdir(DOWNLOAD_DIR):
+        return
+    now = time.time()
+    for name in os.listdir(DOWNLOAD_DIR):
+        path = os.path.join(DOWNLOAD_DIR, name)
+        try:
+            if now - os.path.getmtime(path) > DOWNLOAD_MAX_AGE:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def _finished_files(folder: str) -> List[str]:
+    if not os.path.isdir(folder):
+        return []
+    return [
+        os.path.join(folder, name)
+        for name in sorted(os.listdir(folder))
+        if not name.endswith((".part", ".ytdl", ".temp"))
+    ]
+
+
+def _fetch(target: str, folder: str, same_title: Optional[str]):
+    """Search or open `target` and download ONE song into `folder`.
+
+    yt-dlp is blocking, so this runs in a worker thread. Returns
+    (absolute file path, metadata dict) or (None, None).
+    """
+    os.makedirs(folder, exist_ok=True)
+
+    def accept(info, *, incomplete=False):
+        # Once one song is downloaded, skip the other search results.
+        if _finished_files(folder):
+            return "already have a song"
+        if info.get("is_live"):
+            return "live stream, not downloaded"
+        title = (info.get("title") or "").lower()
+        if same_title and title.startswith(same_title):
+            return "same song as the last one"
+        return None
+
+    options = {
+        "format": AUDIO_FORMAT,
+        "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
+        "noplaylist": True,
+        "playlist_items": "1-3",
+        "ignoreerrors": True,
+        "match_filter": accept,
+        "concurrent_fragment_downloads": 16,
+        "retries": 2,
+        "fragment_retries": 3,
+        "socket_timeout": 15,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "nocheckcertificate": True,
+        "geo_bypass": True,
+    }
+    info = None
+    try:
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(target, download=True)
+    except Exception as e:
+        print(f"[fetch] yt-dlp stopped for {target!r}: {type(e).__name__}: {str(e)[:300]}")
+
+    files = _finished_files(folder)
+    if not files:
+        shutil.rmtree(folder, ignore_errors=True)
+        return None, None
+    path = files[0]
+    track_id = os.path.splitext(os.path.basename(path))[0]
+    if info and "entries" in info:
+        entries = [e for e in (info.get("entries") or []) if e]
+    else:
+        entries = [info or {}]
+    meta = next((e for e in entries if str(e.get("id")) == track_id), None)
+    if meta is None:
+        meta = entries[0] if entries else {}
+    return os.path.abspath(path), meta
 
 
 class Song:
@@ -38,27 +137,24 @@ class Song:
     _yt_blocked_until: float = 0.0
 
     def __init__(self, link: Union[str, dict], request_msg: Message) -> None:
-        if isinstance(link, str):
-            self.title: str = None
-            self.duration: str = None
-            self.thumb: str = None
-            self.remote: str = None
-            self.source: str = link
-            self.headers: dict = None
-            self.request_msg: Message = request_msg
-            self.requested_by: User = request_msg.from_user
-            self.parsed: bool = False
-            self._retries: int = 0
-        elif isinstance(link, dict):
-            self.parsed: bool = True
-            self._retries: int = 0
-            self.duration: str = "N/A"
-            self.headers: dict = None
-            self.thumb: str = DEFAULT_THUMB
+        self.title: Optional[str] = None      # markdown-safe, for text messages
+        self.raw_title: Optional[str] = None  # plain, for the card and cover
+        self.duration: str = "N/A"
+        self.thumb: Optional[str] = None
+        self.remote: Optional[str] = None
+        self.headers: Optional[dict] = None
+        self.protocol: str = ""
+        self.page_url: Optional[str] = None
+        self.source: str = link if isinstance(link, str) else ""
+        self.parsed: bool = False
+        self._retries: int = 0
+        if isinstance(link, dict):
+            self.parsed = True
+            self.thumb = DEFAULT_THUMB
             for key, value in link.items():
                 setattr(self, key, value)
-            self.request_msg: Message = request_msg
-            self.requested_by: User = request_msg.from_user
+        self.request_msg: Message = request_msg
+        self.requested_by: User = request_msg.from_user
 
     async def parse(self) -> Tuple[bool, str]:
         if self.parsed:
@@ -66,49 +162,67 @@ class Song:
 
         self._t0 = time.time()
         source = self.source
-        is_search_text = "://" not in source and not source.startswith(
-            ("ytsearch", "scsearch")
-        )
-
-        # 1) Try the source itself (YouTube, SoundCloud, direct link, ...).
-        video = None
+        is_search_text = "://" not in source
         is_youtube = "youtube.com" in source or "youtu.be" in source
-        # If YouTube was blocked a moment ago, do not waste ~10 seconds asking
-        # again: go straight to the SoundCloud fallback.
-        skip_youtube = is_youtube and time.time() < Song._yt_blocked_until
-        if not is_search_text and not skip_youtube:
-            video = await self._extract(source)
-            if video and await self._playable(video):
-                await self._fill(video)
-                return (True, "PARSED")
-            if is_youtube:
-                Song._yt_blocked_until = time.time() + 900
 
-        # 2) The source did not work (for example YouTube answers 403 on this
-        #    host). Fall back to SoundCloud, searching by the song name.
-        if "soundcloud.com" not in source:
-            query = source if is_search_text else (video or {}).get("title")
-            if not query:
+        ok = False
+        if is_search_text:
+            # Plain song name: YouTube is blocked on this host, so search SoundCloud.
+            ok = await self._fetch_song(f"scsearch3:{self._clean_query(source)}")
+        else:
+            # A YouTube link is tried once, then skipped for 15 minutes.
+            if not (is_youtube and time.time() < Song._yt_blocked_until):
+                ok = await self._fetch_song(source)
+                if not ok and is_youtube:
+                    Song._yt_blocked_until = time.time() + 900
+            # Fallback: search SoundCloud by the song name.
+            if not ok and "soundcloud.com" not in source:
                 query = await self._guess_title()
-            if query:
-                query = self._clean_query(query)
-                print(f"[fallback] trying SoundCloud for {query!r}")
-                # Some results are DRM protected or blocked, so try the first
-                # few matches instead of only the first one.
-                for sc_video in await self._extract_many(f"scsearch3:{query}"):
-                    if await self._playable(sc_video):
-                        await self._fill(sc_video)
-                        return (True, "PARSED")
+                if query:
+                    query = self._clean_query(query)
+                    print(f"[fallback] trying SoundCloud for {query!r}")
+                    ok = await self._fetch_song(f"scsearch3:{query}", fallback=query)
 
+        if ok:
+            print(f"[song] ready in {time.time() - self._t0:.1f}s: {self.raw_title!r}")
+            return (True, "PARSED")
         self._retries += 1
         return (False, "MAX_RETRY_LIMIT_REACHED")
+
+    async def _fetch_song(
+        self, target: str, same_title: Optional[str] = None, fallback: Optional[str] = None
+    ) -> bool:
+        _cleanup_downloads()
+        folder = os.path.join(DOWNLOAD_DIR, str(time.time_ns()))
+        try:
+            path, meta = await asyncio.wait_for(
+                asyncio.to_thread(_fetch, target, folder, same_title),
+                timeout=FETCH_TIMEOUT,
+            )
+        except Exception as e:
+            print(f"[fetch] failed for {target!r}: {type(e).__name__}: {e}")
+            return False
+        if not path:
+            return False
+        self._apply(path, meta, fallback)
+        return True
+
+    def _apply(self, path: str, meta: dict, fallback: Optional[str]) -> None:
+        self.raw_title = meta.get("title") or fallback or "Unknown"
+        self.title = self._escape(self.raw_title)
+        self.duration = _format_duration(meta.get("duration"))
+        self.thumb = meta.get("thumbnail") or DEFAULT_THUMB
+        self.remote = path  # local file, no network reads while playing
+        self.headers = None
+        self.protocol = "file"
+        self.page_url = meta.get("webpage_url") or self.source
+        self.parsed = True
 
     async def _guess_title(self) -> Optional[str]:
         """Find a song name when YouTube refused to give any details.
 
         1) The words the user typed after the command (/play gata only).
-        2) For a pasted YouTube link, the title from YouTube's oEmbed page,
-           which normally does not ask for a sign-in.
+        2) For a pasted YouTube link, the title from YouTube's oEmbed page.
         """
         try:
             parts = (self.request_msg.text or "").split(maxsplit=1)
@@ -126,9 +240,8 @@ class Song:
                 )
                 if response.status == 200:
                     data = await response.json(content_type=None)
-                    title = data.get("title")
-                    if title:
-                        return title
+                    if data.get("title"):
+                        return data["title"]
                 print(f"[oembed] status {response.status}")
             except BaseException as e:
                 print(f"[oembed] failed: {type(e).__name__}: {e}")
@@ -145,78 +258,22 @@ class Song:
 
     @classmethod
     async def related(cls, last: "Song") -> Optional["Song"]:
-        """Autoplay: find a song similar to the one that just ended."""
-        query = cls._clean_query((last.title or "").replace("\\", ""))
-        if not query:
+        """Autoplay: download a song similar to the one that just ended."""
+        base = (getattr(last, "raw_title", None) or last.title or "").replace("\\", "")
+        base = cls._clean_query(base)
+        if not base:
             return None
-        song = cls(query, last.request_msg)
-        same = query.lower()[:20]
-        for video in await song._extract_many(f"scsearch8:{query}"):
-            if (video.get("title") or "").lower().startswith(same):
-                continue
-            if await song._playable(video):
-                await song._fill(video)
-                song.source = video.get("webpage_url") or query
-                song.requested_by = last.requested_by
-                print(f"[autoplay] next: {song.title!r}")
-                return song
-        print(f"[autoplay] nothing similar found for {query!r}")
-        return None
-
-    async def _extract_many(self, target: str) -> List[dict]:
-        # sys.executable -m yt_dlp uses the same Python environment as the bot,
-        # so it works even if the yt-dlp command is not in PATH.
-        # -i keeps going when one result fails (for example DRM protected).
-        process = await asyncio.create_subprocess_shell(
-            f"{quote(sys.executable)} -m yt_dlp -i --no-warnings --print-json "
-            f"--skip-download -f {quote(AUDIO_FORMAT)} {quote(target)}",
-            stdout=PIPE,
-            stderr=PIPE,
+        song = cls(base, last.request_msg)
+        ok = await song._fetch_song(
+            f"scsearch8:{base}", same_title=base.lower()[:20], fallback=base
         )
-        out, err = await process.communicate()
-        results = []
-        for line in out.decode(errors="ignore").splitlines():
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    results.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
-        if not results:
-            print(
-                f"[yt-dlp] failed for {target!r}:\n{err.decode(errors='ignore')[-800:]}"
-            )
-        return results
-
-    async def _extract(self, target: str) -> Optional[dict]:
-        results = await self._extract_many(target)
-        return results[0] if results else None
-
-    async def _playable(self, video: dict) -> bool:
-        url = video.get("url")
-        if not url:
-            return False
-        return await self.check_remote_url(url, video.get("http_headers"))
-
-    async def _fill(self, video: dict) -> None:
-        headers = video.get("http_headers")
-        thumb = video.get("thumbnail")
-        if not (thumb and await self.check_remote_url(thumb, headers)):
-            thumb = DEFAULT_THUMB
-        self.title = self._escape(video.get("title") or "Unknown")
-        self.duration = str(timedelta(seconds=int(video.get("duration") or 0)))
-        self.thumb = thumb
-        self.remote = video["url"]
-        self.headers = headers
-        self.protocol = video.get("protocol") or ""
-        self.page_url = video.get("webpage_url") or self.source
-        self.parsed = True
-        print(
-            f"[song] ready: {video.get('title')!r} "
-            f"ext={video.get('ext')} protocol={video.get('protocol')} "
-            f"host={urlparse(self.remote).netloc} "
-            f"| finding the song took {time.time() - getattr(self, '_t0', time.time()):.1f}s"
-        )
+        if not ok:
+            print(f"[autoplay] nothing similar found for {base!r}")
+            return None
+        song.requested_by = last.requested_by
+        song.source = song.page_url or base
+        print(f"[autoplay] next: {song.raw_title!r}")
+        return song
 
     @staticmethod
     async def check_remote_url(
@@ -240,8 +297,7 @@ class Song:
     @staticmethod
     def _escape(_title: str) -> str:
         title = _title
-        f = ["**", "__", "`", "~~", "--"]
-        for i in f:
+        for i in ["**", "__", "`", "~~", "--"]:
             title = title.replace(i, f"\\{i}")
         return title
 
