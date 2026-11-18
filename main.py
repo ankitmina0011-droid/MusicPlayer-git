@@ -21,7 +21,10 @@ import json
 import shutil
 from config import config
 from core.song import Song
-from pyrogram.types import Message
+from core import ui
+from lang import load
+from pyrogram import enums
+from pyrogram.types import Message, CallbackQuery
 from pytgcalls import filters as fl
 from pyrogram import Client, filters
 from pytgcalls.types import Update, ChatUpdate
@@ -77,14 +80,27 @@ async def ping(_, message: Message):
 @language
 @handle_error
 async def start(_, message: Message, lang):
-    await message.reply_text(lang["startText"] % message.from_user.mention)
+    try:
+        bot_username = client.me.username if getattr(client, "me", None) else ""
+        await ui.send_start(
+            message.chat.id,
+            ui.start_caption(ui.user_link(message.from_user)),
+            bot_username or "",
+        )
+    except Exception as e:
+        print(f"[start] styled card failed ({type(e).__name__}: {e}), sending plain text")
+        await message.reply_text(lang["startText"] % message.from_user.mention)
 
 
 @client.on_message(filters.command("help", config.PREFIXES) & ~filters.bot)
 @language
 @handle_error
 async def help(_, message: Message, lang):
-    await message.reply_text(lang["helpText"].replace("<prefix>", config.PREFIXES[0]))
+    try:
+        await ui.send_help(message.chat.id)
+    except Exception as e:
+        print(f"[help] styled help failed ({type(e).__name__}: {e}), sending plain text")
+        await message.reply_text(lang["helpText"].replace("<prefix>", config.PREFIXES[0]))
 
 
 @client.on_message(filters.command(["p", "play", "vp", "vplay"], config.PREFIXES) & ~filters.private)
@@ -195,30 +211,8 @@ async def live_stream(_, message: Message, lang):
 @only_admins
 @handle_error
 async def skip_track(_, message: Message, lang):
-    chat_id = message.chat.id
-    group = get_group(chat_id)
-    if group["loop"]:
-        await start_stream(group["now_playing"], lang)
-    else:
-        queue = get_queue(chat_id)
-        if len(queue) > 0:
-            next_song = await queue.get()
-            if not next_song.parsed:
-                ok, status = await next_song.parse()
-                if not ok:
-                    raise Exception(status)
-            set_group(chat_id, now_playing=next_song)
-            await start_stream(next_song, lang)
-            await delete_messages([message])
-        else:
-            set_group(chat_id, is_playing=False, now_playing=None)
-            await set_title(message, "")
-            try:
-                await pytgcalls.leave_call(chat_id)
-                k = await message.reply_text(lang["queueEmpty"])
-            except (NoActiveGroupCall, NotInCallError):
-                k = await message.reply_text(lang["notActive"])
-            await delete_messages([message, k])
+    await _play_next(message.chat.id, lang)
+    await delete_messages([message])
 
 
 @client.on_message(filters.command(["m", "mute"], config.PREFIXES) & ~filters.private)
@@ -573,48 +567,138 @@ async def update_restart(_, message: Message, lang):
     os.system(f"kill -9 {os.getpid()} && bash startup.sh")
 
 
+async def _play_next(chat_id: int, lang) -> None:
+    """Play the next song: repeat, the queue, autoplay, or leave the call."""
+    group = get_group(chat_id)
+    if group["loop"]:
+        await start_stream(group["now_playing"], lang)
+        return
+    queue = get_queue(chat_id)
+    if len(queue) > 0:
+        next_song = await queue.get()
+        if not next_song.parsed:
+            ok, status = await next_song.parse()
+            if not ok:
+                raise Exception(status)
+        set_group(chat_id, now_playing=next_song)
+        await start_stream(next_song, lang)
+        return
+    last = group.get("now_playing")
+    next_song = None
+    if AUTOPLAY and isinstance(last, Song):
+        try:
+            next_song = await Song.related(last)
+        except BaseException:
+            next_song = None
+    if next_song is not None:
+        set_group(chat_id, now_playing=next_song)
+        await start_stream(next_song, lang)
+        return
+    if safone.get(chat_id) is not None:
+        try:
+            await safone[chat_id].delete()
+        except BaseException:
+            pass
+    await set_title(chat_id, "", client=app)
+    set_group(chat_id, is_playing=False, now_playing=None)
+    try:
+        await pytgcalls.leave_call(chat_id)
+    except (NoActiveGroupCall, NotInCallError):
+        pass
+
+
+def _lang_for(chat_id: int):
+    try:
+        return load(get_group(chat_id)["lang"])
+    except Exception:
+        return load(config.LANGUAGE)
+
+
+async def _can_control(query: CallbackQuery, chat_id: int) -> bool:
+    user = query.from_user
+    if user is None:
+        return False
+    if user.id in config.SUDOERS:
+        return True
+    try:
+        member = await client.get_chat_member(chat_id, user.id)
+    except Exception:
+        return False
+    return member.status in (
+        enums.ChatMemberStatus.ADMINISTRATOR,
+        enums.ChatMemberStatus.OWNER,
+    )
+
+
+async def _answer(query: CallbackQuery, text: str = "", alert: bool = False) -> None:
+    try:
+        await query.answer(text, show_alert=alert)
+    except Exception:
+        pass
+
+
+@client.on_callback_query(filters.regex(r"^pl:[a-z]+:-?\d+$"))
+async def player_buttons(_, query: CallbackQuery):
+    _, action, raw_id = query.data.split(":")
+    chat_id = int(raw_id)
+    lang = _lang_for(chat_id)
+    try:
+        if action == "close":
+            await _answer(query)
+            await query.message.delete()
+            return
+        if action == "queue":
+            queue = get_queue(chat_id)
+            text = str(queue) if len(queue) > 0 else lang["queueEmpty"]
+            await _answer(query)
+            await client.send_message(chat_id, text, disable_web_page_preview=True)
+            return
+        if not await _can_control(query, chat_id):
+            await _answer(query, lang["notAllowed"], alert=True)
+            return
+        if action == "pause":
+            await pytgcalls.pause_stream(chat_id)
+            await _answer(query, "⏸ Paused")
+        elif action == "resume":
+            await pytgcalls.resume_stream(chat_id)
+            await _answer(query, "▶ Resumed")
+        elif action == "loop":
+            enabled = not get_group(chat_id)["loop"]
+            set_group(chat_id, loop=enabled)
+            await _answer(query, lang["loopMode"] % ("Enabled" if enabled else "Disabled"))
+        elif action == "skip":
+            await _answer(query, "⏭ Skipping")
+            await _play_next(chat_id, lang)
+        elif action == "stop":
+            set_group(chat_id, is_playing=False, now_playing=None)
+            clear_queue(chat_id)
+            await set_title(chat_id, "", client=app)
+            await _answer(query, "⏹ Stopped")
+            await pytgcalls.leave_call(chat_id)
+        else:
+            await _answer(query)
+    except (NoActiveGroupCall, NotInCallError):
+        await _answer(query, lang["notActive"], alert=True)
+    except Exception as e:
+        print(f"[button] {action} failed: {type(e).__name__}: {e}")
+        await _answer(query, "Something went wrong, try again.", alert=True)
+
+
+@client.on_callback_query(filters.regex(r"^help$"))
+async def help_button(_, query: CallbackQuery):
+    await _answer(query)
+    try:
+        await ui.send_help(query.message.chat.id)
+    except Exception as e:
+        print(f"[help] could not send help: {type(e).__name__}: {e}")
+
+
 @pytgcalls.on_update()
 @language
 @handle_error
 async def stream_end(_, update: Update, lang):
     if isinstance(update, StreamEnded):
-        chat_id = update.chat_id
-        group = get_group(chat_id)
-        if group["loop"]:
-            await start_stream(group["now_playing"], lang)
-        else:
-            queue = get_queue(chat_id)
-            if len(queue) > 0:
-                next_song = await queue.get()
-                if not next_song.parsed:
-                    ok, status = await next_song.parse()
-                    if not ok:
-                        raise Exception(status)
-                set_group(chat_id, now_playing=next_song)
-                await start_stream(next_song, lang)
-            else:
-                last = group.get("now_playing")
-                next_song = None
-                if AUTOPLAY and isinstance(last, Song):
-                    try:
-                        next_song = await Song.related(last)
-                    except BaseException:
-                        next_song = None
-                if next_song is not None:
-                    set_group(chat_id, now_playing=next_song)
-                    await start_stream(next_song, lang)
-                    return
-                if safone.get(chat_id) is not None:
-                    try:
-                        await safone[chat_id].delete()
-                    except BaseException:
-                        pass
-                await set_title(chat_id, "", client=app)
-                set_group(chat_id, is_playing=False, now_playing=None)
-                try:
-                    await pytgcalls.leave_call(chat_id)
-                except (NoActiveGroupCall, NotInCallError):
-                    pass
+        await _play_next(update.chat_id, lang)
 
 
 @pytgcalls.on_update(fl.chat_update(ChatUpdate.Status.LEFT_CALL))
