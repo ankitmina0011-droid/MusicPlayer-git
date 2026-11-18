@@ -73,6 +73,7 @@ _ensure_ffmpeg()
 
 
 safone = {}
+_background_tasks = set()
 ydl_opts = {
     "quiet": True,
     "geo_bypass": True,
@@ -176,34 +177,51 @@ async def start_stream(song: Song, lang):
         )
         return await start_stream(song, lang)
     print(f"[stream] play() finished, joining the call took {time.time() - _t0:.1f}s")
-    await set_title(chat.id, song.title, client=app)
-    thumb = await generate_cover(
-        song.title,
-        chat.title,
-        chat.id,
-        song.thumb,
-    )
-    print(f"[stream] cover image ready at {time.time() - _t0:.1f}s")
-    safone[chat.id] = await song.request_msg.reply_photo(
-        photo=thumb,
-        caption=lang["playing"]
-        % (
+    # The song is already playing. Build the cover photo and the "now playing"
+    # message in the background so nothing waits for it.
+    task = asyncio.create_task(_announce(song, lang, chat, infomsg, _t0))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _announce(song: Song, lang, chat, infomsg, t0: float) -> None:
+    thumb = None
+    try:
+        await set_title(chat.id, song.title, client=app)
+        thumb = await generate_cover(
             song.title,
-            song.source,
-            song.duration,
-            song.request_msg.chat.id,
-            (
-                song.requested_by.mention
-                if song.requested_by
-                else song.request_msg.sender_chat.title
+            chat.title,
+            chat.id,
+            song.thumb,
+        )
+        print(f"[stream] cover image ready at {time.time() - t0:.1f}s")
+        safone[chat.id] = await song.request_msg.reply_photo(
+            photo=thumb,
+            caption=lang["playing"]
+            % (
+                song.title,
+                song.source,
+                song.duration,
+                song.request_msg.chat.id,
+                (
+                    song.requested_by.mention
+                    if song.requested_by
+                    else song.request_msg.sender_chat.title
+                ),
             ),
-        ),
-        quote=False,
-    )
-    print(f"[stream] all done in {time.time() - _t0:.1f}s")
-    await infomsg.delete()
-    if os.path.exists(thumb):
-        os.remove(thumb)
+            quote=False,
+        )
+        print(f"[stream] now-playing message sent at {time.time() - t0:.1f}s")
+    except Exception as e:
+        # The song keeps playing even if the photo or title could not be made.
+        print(f"[stream] could not send the now-playing message: {type(e).__name__}: {e}")
+    finally:
+        try:
+            await infomsg.delete()
+        except BaseException:
+            pass
+        if thumb and os.path.exists(thumb):
+            os.remove(thumb)
 
 
 def get_quality(song: Song) -> MediaStream:
