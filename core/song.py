@@ -142,6 +142,26 @@ class Song:
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned or text
 
+    @classmethod
+    async def related(cls, last: "Song") -> Optional["Song"]:
+        """Autoplay: find a song similar to the one that just ended."""
+        query = cls._clean_query((last.title or "").replace("\\", ""))
+        if not query:
+            return None
+        song = cls(query, last.request_msg)
+        same = query.lower()[:20]
+        for video in await song._extract_many(f"scsearch8:{query}"):
+            if (video.get("title") or "").lower().startswith(same):
+                continue
+            if await song._playable(video):
+                await song._fill(video)
+                song.source = video.get("webpage_url") or query
+                song.requested_by = last.requested_by
+                print(f"[autoplay] next: {song.title!r}")
+                return song
+        print(f"[autoplay] nothing similar found for {query!r}")
+        return None
+
     async def _extract_many(self, target: str) -> List[dict]:
         # sys.executable -m yt_dlp uses the same Python environment as the bot,
         # so it works even if the yt-dlp command is not in PATH.
