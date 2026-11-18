@@ -27,6 +27,7 @@ from pyrogram import Client, filters
 from pytgcalls.types import Update, ChatUpdate
 from pytgcalls.types.stream import StreamEnded
 from core.decorators import language, register, only_admins, handle_error
+from core.song import Song
 from pytgcalls.exceptions import (
     NotInCallError, NoActiveGroupCall)
 from core import (
@@ -42,6 +43,10 @@ REPO = """
 - Repo: [GitHub](https://github.com/ankitmina558-cyber/MusicPlayer-git)
 - License: AGPL-3.0-or-later
 """
+
+# Autoplay: when the queue is empty, keep playing similar songs.
+# Set environment variable AUTOPLAY=false to turn it off.
+AUTOPLAY = os.environ.get("AUTOPLAY", "true").lower() == "true"
 
 if config.BOT_TOKEN:
     bot = Client(
@@ -576,6 +581,17 @@ async def stream_end(_, update: Update, lang):
                 set_group(chat_id, now_playing=next_song)
                 await start_stream(next_song, lang)
             else:
+                last = group.get("now_playing")
+                next_song = None
+                if AUTOPLAY and isinstance(last, Song):
+                    try:
+                        next_song = await Song.related(last)
+                    except BaseException:
+                        next_song = None
+                if next_song is not None:
+                    set_group(chat_id, now_playing=next_song)
+                    await start_stream(next_song, lang)
+                    return
                 if safone.get(chat_id) is not None:
                     try:
                         await safone[chat_id].delete()
