@@ -34,6 +34,8 @@ DOWNLOAD_MAX_AGE = 3 * 60 * 60  # seconds, older song folders are deleted
 AUDIO_FORMAT = "bestaudio[protocol!=m3u8_native][protocol!=m3u8]/bestaudio/best"
 DEFAULT_THUMB = "https://telegra.ph/file/820cac7cb7b1a025542e2.jpg"
 FETCH_TIMEOUT = 60  # seconds for one search + download
+# YouTube is blocked on FadeHost. Set TRY_YOUTUBE=true only if your host can reach it.
+TRY_YOUTUBE = os.environ.get("TRY_YOUTUBE", "false").lower() == "true"
 
 
 def _format_duration(seconds) -> str:
@@ -170,8 +172,12 @@ class Song:
             # Plain song name: YouTube is blocked on this host, so search SoundCloud.
             ok = await self._fetch_song(f"scsearch3:{self._clean_query(source)}")
         else:
-            # A YouTube link is tried once, then skipped for 15 minutes.
-            if not (is_youtube and time.time() < Song._yt_blocked_until):
+            # By default a YouTube link goes straight to SoundCloud by its title,
+            # because YouTube is blocked on this host and trying it costs seconds.
+            youtube_skipped = is_youtube and (
+                not TRY_YOUTUBE or time.time() < Song._yt_blocked_until
+            )
+            if not youtube_skipped:
                 ok = await self._fetch_song(source)
                 if not ok and is_youtube:
                     Song._yt_blocked_until = time.time() + 900
