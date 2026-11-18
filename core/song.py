@@ -75,6 +75,8 @@ class Song:
         #    host). Fall back to SoundCloud, searching by the song name.
         if "soundcloud.com" not in source:
             query = source if is_search_text else (video or {}).get("title")
+            if not query:
+                query = await self._guess_title()
             if query:
                 print(f"[fallback] trying SoundCloud for {query!r}")
                 sc_video = await self._extract(f"scsearch1:{query}")
@@ -84,6 +86,39 @@ class Song:
 
         self._retries += 1
         return (False, "MAX_RETRY_LIMIT_REACHED")
+
+    async def _guess_title(self) -> Optional[str]:
+        """Find a song name when YouTube refused to give any details.
+
+        1) The words the user typed after the command (/play gata only).
+        2) For a pasted YouTube link, the title from YouTube's oEmbed page,
+           which normally does not ask for a sign-in.
+        """
+        try:
+            parts = (self.request_msg.text or "").split(maxsplit=1)
+            if len(parts) > 1 and "://" not in parts[1]:
+                return parts[1].strip()
+        except BaseException:
+            pass
+        if "youtube.com" in self.source or "youtu.be" in self.source:
+            session = ClientSession()
+            try:
+                response = await session.get(
+                    "https://www.youtube.com/oembed",
+                    params={"url": self.source, "format": "json"},
+                    timeout=10,
+                )
+                if response.status == 200:
+                    data = await response.json(content_type=None)
+                    title = data.get("title")
+                    if title:
+                        return title
+                print(f"[oembed] status {response.status}")
+            except BaseException as e:
+                print(f"[oembed] failed: {type(e).__name__}: {e}")
+            finally:
+                await session.close()
+        return None
 
     async def _extract(self, target: str) -> Optional[dict]:
         # sys.executable -m yt_dlp uses the same Python environment as the bot,
