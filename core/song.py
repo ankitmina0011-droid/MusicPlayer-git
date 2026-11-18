@@ -18,6 +18,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>
 
 import re
 import sys
+import time
 import json
 import asyncio
 from shlex import quote
@@ -32,6 +33,9 @@ DEFAULT_THUMB = "https://telegra.ph/file/820cac7cb7b1a025542e2.jpg"
 
 
 class Song:
+    # Time until which YouTube is treated as blocked on this host.
+    _yt_blocked_until: float = 0.0
+
     def __init__(self, link: Union[str, dict], request_msg: Message) -> None:
         if isinstance(link, str):
             self.title: str = None
@@ -66,11 +70,17 @@ class Song:
 
         # 1) Try the source itself (YouTube, SoundCloud, direct link, ...).
         video = None
-        if not is_search_text:
+        is_youtube = "youtube.com" in source or "youtu.be" in source
+        # If YouTube was blocked a moment ago, do not waste ~10 seconds asking
+        # again: go straight to the SoundCloud fallback.
+        skip_youtube = is_youtube and time.time() < Song._yt_blocked_until
+        if not is_search_text and not skip_youtube:
             video = await self._extract(source)
             if video and await self._playable(video):
                 await self._fill(video)
                 return (True, "PARSED")
+            if is_youtube:
+                Song._yt_blocked_until = time.time() + 900
 
         # 2) The source did not work (for example YouTube answers 403 on this
         #    host). Fall back to SoundCloud, searching by the song name.
@@ -83,7 +93,7 @@ class Song:
                 print(f"[fallback] trying SoundCloud for {query!r}")
                 # Some results are DRM protected or blocked, so try the first
                 # few matches instead of only the first one.
-                for sc_video in await self._extract_many(f"scsearch5:{query}"):
+                for sc_video in await self._extract_many(f"scsearch3:{query}"):
                     if await self._playable(sc_video):
                         await self._fill(sc_video)
                         return (True, "PARSED")
