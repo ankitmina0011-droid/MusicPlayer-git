@@ -267,4 +267,4 @@ def get_quality(song: Song) -> MediaStream:
                 AudioQuality.HIGH,
                 video_flags=MediaStream.Flags.IGNORE,
                 headers=song.headers,
-    )
+            )
