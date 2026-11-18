@@ -63,6 +63,7 @@ class Song:
         if self.parsed:
             return (True, "ALREADY_PARSED")
 
+        self._t0 = time.time()
         source = self.source
         is_search_text = "://" not in source and not source.startswith(
             ("ytsearch", "scsearch")
@@ -186,11 +187,14 @@ class Song:
         self.thumb = thumb
         self.remote = video["url"]
         self.headers = headers
+        self.protocol = video.get("protocol") or ""
+        self.page_url = video.get("webpage_url") or self.source
         self.parsed = True
         print(
             f"[song] ready: {video.get('title')!r} "
             f"ext={video.get('ext')} protocol={video.get('protocol')} "
-            f"host={urlparse(self.remote).netloc}"
+            f"host={urlparse(self.remote).netloc} "
+            f"| finding the song took {time.time() - getattr(self, '_t0', time.time()):.1f}s"
         )
 
     @staticmethod
