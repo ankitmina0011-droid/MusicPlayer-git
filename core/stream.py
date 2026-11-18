@@ -136,14 +136,15 @@ async def _download_local(song: Song) -> Optional[str]:
     return None
 
 
-async def start_stream(song: Song, lang):
+async def start_stream(song: Song, lang, infomsg=None):
     chat = song.request_msg.chat
     if safone.get(chat.id) is not None:
         try:
             await safone[chat.id].delete()
         except BaseException:
             pass
-    infomsg = await song.request_msg.reply_text(lang["downloading"])
+    if infomsg is None:
+        infomsg = await song.request_msg.reply_text(lang["downloading"])
     _t0 = time.time()
     print(f"[stream] starting {song.title!r} in chat {chat.id}")
     # HLS (m3u8) streams, like SoundCloud's, start very slowly when read live.
@@ -175,7 +176,7 @@ async def start_stream(song: Song, lang):
                 random_id=app.rnd_id() // 9000000000,
             )
         )
-        return await start_stream(song, lang)
+        return await start_stream(song, lang, infomsg)
     print(f"[stream] play() finished, joining the call took {time.time() - _t0:.1f}s")
     # The song is already playing. Build the cover photo and the "now playing"
     # message in the background so nothing waits for it.
