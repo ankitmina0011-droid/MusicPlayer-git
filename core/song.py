@@ -177,6 +177,11 @@ class Song:
         self.remote = video["url"]
         self.headers = headers
         self.parsed = True
+        print(
+            f"[song] ready: {video.get('title')!r} "
+            f"ext={video.get('ext')} protocol={video.get('protocol')} "
+            f"host={urlparse(self.remote).netloc}"
+        )
 
     @staticmethod
     async def check_remote_url(
