@@ -17,8 +17,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>
 """
 
 import os
+import sys
+import time
 import shutil
+import asyncio
 import tempfile
+from shlex import quote
+from subprocess import PIPE
+from typing import Optional, Tuple
 from config import config
 from core.song import Song
 from pyrogram import Client
@@ -83,6 +89,43 @@ ytdl = YoutubeDL(ydl_opts)
 pytgcalls = PyTgCalls(app)
 
 
+async def _probe(song: Song) -> Tuple[bool, str]:
+    """Let ffmpeg read 3 seconds of the stream and report what went wrong."""
+    cmd = ["ffmpeg", "-v", "error", "-nostdin"]
+    if song.headers:
+        cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in song.headers.items())]
+    cmd += ["-i", song.remote, "-t", "3", "-f", "null", "-"]
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE)
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=25)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return False, "timed out after 25 seconds"
+    except BaseException as e:
+        return False, f"{type(e).__name__}: {e}"
+    return proc.returncode == 0, err.decode(errors="ignore").strip()[-500:]
+
+
+async def _download_local(song: Song) -> Optional[str]:
+    """Download the song to the server and return the file path."""
+    os.makedirs("downloads", exist_ok=True)
+    template = os.path.join("downloads", f"{time.time_ns()}.%(ext)s")
+    url = getattr(song, "page_url", None) or song.source
+    process = await asyncio.create_subprocess_shell(
+        f"{quote(sys.executable)} -m yt_dlp --no-warnings --no-playlist -f best "
+        f"-o {quote(template)} --print after_move:filepath {quote(url)}",
+        stdout=PIPE,
+        stderr=PIPE,
+    )
+    out, err = await process.communicate()
+    lines = [x.strip() for x in out.decode(errors="ignore").splitlines() if x.strip()]
+    path = lines[-1] if lines else None
+    if path and os.path.exists(path):
+        return path
+    print(f"[download] failed:\n{err.decode(errors='ignore')[-500:]}")
+    return None
+
+
 async def start_stream(song: Song, lang):
     chat = song.request_msg.chat
     if safone.get(chat.id) is not None:
@@ -91,7 +134,18 @@ async def start_stream(song: Song, lang):
         except BaseException:
             pass
     infomsg = await song.request_msg.reply_text(lang["downloading"])
+    _t0 = time.time()
     print(f"[stream] starting {song.title!r} in chat {chat.id}")
+    # Streams in HLS (m3u8) form are the ones ffmpeg often cannot read directly.
+    if "m3u8" in (getattr(song, "protocol", "") or ""):
+        ok, info = await _probe(song)
+        print(f"[probe] ffmpeg {'ok' if ok else 'FAILED: ' + info}")
+        if not ok:
+            local = await _download_local(song)
+            if local:
+                print(f"[probe] playing the downloaded copy: {local}")
+                song.remote = local
+                song.headers = None
     try:
         await pytgcalls.play(
             chat.id,
@@ -109,6 +163,7 @@ async def start_stream(song: Song, lang):
             )
         )
         return await start_stream(song, lang)
+    print(f"[stream] play() finished, joining the call took {time.time() - _t0:.1f}s")
     await set_title(chat.id, song.title, client=app)
     thumb = await generate_cover(
         song.title,
@@ -116,6 +171,7 @@ async def start_stream(song: Song, lang):
         chat.id,
         song.thumb,
     )
+    print(f"[stream] cover image ready at {time.time() - _t0:.1f}s")
     safone[chat.id] = await song.request_msg.reply_photo(
         photo=thumb,
         caption=lang["playing"]
@@ -132,6 +188,7 @@ async def start_stream(song: Song, lang):
         ),
         quote=False,
     )
+    print(f"[stream] all done in {time.time() - _t0:.1f}s")
     await infomsg.delete()
     if os.path.exists(thumb):
         os.remove(thumb)
