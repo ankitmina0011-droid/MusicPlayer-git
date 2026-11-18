@@ -18,6 +18,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>
 
 import os
 import time
+import wave
 import shutil
 import asyncio
 import tempfile
@@ -29,7 +30,7 @@ from pyrogram import Client
 from yt_dlp import YoutubeDL
 from pytgcalls import PyTgCalls
 from core.funcs import generate_cover
-from core.groups import get_group, set_title
+from core.groups import get_group, set_group, set_title
 from pytgcalls.types.stream import MediaStream
 from pyrogram.raw.types import InputPeerChannel
 from pytgcalls.types import AudioQuality, VideoQuality
@@ -98,6 +99,55 @@ _VIDEO_QUALITY = {
     "low": VideoQuality.SD_480p,
 }
 
+NOTICES = {
+    "not_in_group": "❌ Music account is not in this group. Add it to the group, give it admin rights with Manage video chats, then send /play again.",
+    "admin_required": "❌ Music account needs admin rights with Manage video chats in this group.",
+    "not_found": "❌ Song not found or could not be played. Try another name or link.",
+}
+
+# Silence is played while the song is still downloading. It is long enough
+# that the end of it is never reached in normal use.
+SILENCE_PATH = os.path.abspath("silence.wav")
+
+# Chats where the music account is already inside a voice chat.
+_IN_CALL = set()
+# Chats whose stream is being replaced right now (see _switch).
+_SWITCHING = set()
+
+
+class SongError(Exception):
+    pass
+
+
+class UserbotError(Exception):
+    pass
+
+
+def _make_silence() -> None:
+    if os.path.exists(SILENCE_PATH):
+        return
+    try:
+        with wave.open(SILENCE_PATH, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(8000)
+            wav.writeframes(b"\x00\x00" * 8000 * 300)
+    except Exception as e:
+        print(f"[stream] could not create the silence file: {type(e).__name__}: {e}")
+
+
+_make_silence()
+
+# Join the call while the song downloads needs change_stream from py-tgcalls.
+# If the installed version does not have it, the bot joins after the download.
+PARALLEL_START = hasattr(pytgcalls, "change_stream") and os.path.exists(SILENCE_PATH)
+print(f"[stream] start mode: {'parallel (join + download together)' if PARALLEL_START else 'sequential'}")
+
+
+def forget_call(chat_id: int) -> None:
+    """Call this when the music account has left a voice chat."""
+    _IN_CALL.discard(chat_id)
+
 
 def _spawn(coro) -> None:
     task = asyncio.create_task(coro)
@@ -114,34 +164,203 @@ async def _delete_quietly(message) -> None:
         pass
 
 
-async def start_stream(song: Song, lang, infomsg=None):
-    chat = song.request_msg.chat
-    await _delete_quietly(safone.pop(chat.id, None))
-    if infomsg is None:
-        infomsg = await song.request_msg.reply_text(lang["downloading"])
-    _t0 = time.time()
-    print(f"[stream] starting {song.raw_title or song.title!r} in chat {chat.id}")
-    try:
-        await pytgcalls.play(chat.id, get_quality(song))
-    except NoActiveGroupCall:
-        peer = await app.resolve_peer(chat.id)
-        await app.invoke(
-            CreateGroupCall(
-                peer=InputPeerChannel(
-                    channel_id=peer.channel_id,
-                    access_hash=peer.access_hash,
-                ),
-                random_id=app.rnd_id() // 9000000000,
-            )
+def _is_error(error: Exception, *names: str) -> bool:
+    code = getattr(error, "ID", "") or ""
+    text = str(error)
+    return any(code == name or name in text for name in names)
+
+
+def _media(path: str, headers=None, video: bool = False) -> MediaStream:
+    key = config.QUALITY.lower()
+    if key not in _AUDIO_QUALITY:
+        print("WARNING: Invalid Quality Specified. Defaulting to High!")
+        key = "high"
+    if video:
+        return MediaStream(path, _AUDIO_QUALITY[key], _VIDEO_QUALITY[key], headers=headers)
+    return MediaStream(
+        path, _AUDIO_QUALITY[key], video_flags=MediaStream.Flags.IGNORE, headers=headers
+    )
+
+
+def get_quality(song: Song) -> MediaStream:
+    video = get_group(song.request_msg.chat.id)["stream_mode"] == "video"
+    return _media(song.remote, song.headers, video)
+
+
+async def _create_group_call(chat_id: int) -> None:
+    peer = await app.resolve_peer(chat_id)
+    await app.invoke(
+        CreateGroupCall(
+            peer=InputPeerChannel(
+                channel_id=peer.channel_id,
+                access_hash=peer.access_hash,
+            ),
+            random_id=app.rnd_id() // 9000000000,
         )
-        return await start_stream(song, lang, infomsg)
+    )
+
+
+async def _ensure_userbot_in_chat(chat_id: int) -> bool:
+    """Make sure the music account is in the group. If it is not, join it with
+    an invite link made by the bot (the bot must be an admin with invite rights)."""
+    try:
+        await app.get_chat_member(chat_id, "me")
+        return True
     except Exception:
+        pass
+    try:
+        link = await ui.call("exportChatInviteLink", {"chat_id": chat_id})
+        await app.join_chat(link)
+        print(f"[userbot] joined chat {chat_id} with an invite link")
+        return True
+    except Exception as e:
+        print(f"[userbot] could not join chat {chat_id}: {type(e).__name__}: {e}")
+        return False
+
+
+async def _leave_quietly(chat_id: int) -> None:
+    _IN_CALL.discard(chat_id)
+    try:
+        await pytgcalls.leave_call(chat_id)
+    except Exception:
+        pass
+
+
+async def _play(chat, stream: MediaStream) -> None:
+    """Join the voice chat and start `stream`. Handles the errors this bot has
+    shown: no call running yet, the music account not in the group, and an
+    old call that was not left."""
+    fixed = False
+    for _ in range(5):
+        try:
+            try:
+                await pytgcalls.play(chat.id, stream)
+                _IN_CALL.add(chat.id)
+                return
+            except NoActiveGroupCall:
+                await _create_group_call(chat.id)
+        except Exception as e:
+            if type(e).__name__ == "AlreadyJoinedError":
+                await _leave_quietly(chat.id)
+            elif _is_error(e, "CHANNEL_PRIVATE", "USER_NOT_PARTICIPANT", "PEER_ID_INVALID"):
+                if fixed or not await _ensure_userbot_in_chat(chat.id):
+                    raise UserbotError("not_in_group") from e
+                fixed = True
+            elif _is_error(e, "CHAT_ADMIN_REQUIRED"):
+                raise UserbotError("admin_required") from e
+            else:
+                raise
+    raise UserbotError("not_in_group")
+
+
+async def _switch(chat, song: Song) -> None:
+    """Change the stream of a call we are already in."""
+    _SWITCHING.add(chat.id)
+    try:
+        await pytgcalls.change_stream(chat.id, get_quality(song))
+        _IN_CALL.add(chat.id)
+    except Exception as e:
+        print(f"[stream] change_stream failed ({type(e).__name__}: {e}), joining again")
+        await _leave_quietly(chat.id)
+        await _play(chat, get_quality(song))
+    finally:
+        _SWITCHING.discard(chat.id)
+        # The end of the stream that was replaced can arrive a moment later.
+        get_group(chat.id)["stream_started_at"] = time.time()
+
+
+async def _set_media(chat, song: Song) -> None:
+    if PARALLEL_START and chat.id in _IN_CALL:
+        await _switch(chat, song)
+    else:
+        await _play(chat, get_quality(song))
+
+
+async def _notify(chat_id: int, text: str) -> None:
+    try:
+        result = await ui.call(
+            "sendMessage",
+            {"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+        )
+    except Exception as e:
+        print(f"[stream] could not send the notice: {type(e).__name__}: {e}")
+        return
+    await asyncio.sleep(30)
+    try:
+        await ui.call(
+            "deleteMessage", {"chat_id": chat_id, "message_id": result["message_id"]}
+        )
+    except Exception:
+        pass
+
+
+async def _busy_message(song: Song, lang):
+    try:
+        return await song.request_msg.reply_text(lang["downloading"])
+    except Exception:
+        pass
+    try:
+        result = await ui.call(
+            "sendMessage",
+            {"chat_id": song.request_msg.chat.id, "text": "Processing..."},
+        )
+        return ui.SentMessage(song.request_msg.chat.id, result["message_id"])
+    except Exception:
+        return None
+
+
+async def start_stream(song: Song, lang, infomsg=None, pending=None):
+    """Start `song` in its voice chat.
+
+    `pending` is an asyncio task that finishes song.parse(). When it is given
+    (or the song is not parsed yet) the voice chat join and the download run
+    at the same time, so the join time is the main delay, not both together.
+    """
+    chat = song.request_msg.chat
+    if infomsg is None:
+        infomsg = await _busy_message(song, lang)
+    t0 = time.time()
+    if not song.parsed and pending is None:
+        pending = asyncio.create_task(song.parse())
+    try:
+        if song.parsed:
+            await _set_media(chat, song)
+        elif PARALLEL_START and chat.id not in _IN_CALL:
+            await _play(chat, _media(SILENCE_PATH))
+            print(f"[stream] joined the voice chat at {time.time() - t0:.1f}s")
+            ok, status = await pending
+            print(f"[stream] song ready at {time.time() - t0:.1f}s")
+            if not ok:
+                raise SongError(status)
+            await _switch(chat, song)
+        else:
+            ok, status = await pending
+            print(f"[stream] song ready at {time.time() - t0:.1f}s")
+            if not ok:
+                raise SongError(status)
+            await _set_media(chat, song)
+    except (UserbotError, SongError) as e:
+        if pending is not None and not pending.done():
+            pending.cancel()
+        await _leave_quietly(chat.id)
+        set_group(chat.id, is_playing=False, now_playing=None)
+        key = "not_found" if isinstance(e, SongError) else str(e)
+        _spawn(_notify(chat.id, NOTICES.get(key, NOTICES["not_found"])))
+        await _delete_quietly(infomsg)
+        return
+    except Exception:
+        # An unexpected error must not leave the chat stuck in "playing".
+        if pending is not None and not pending.done():
+            pending.cancel()
+        set_group(chat.id, is_playing=False, now_playing=None)
+        await _leave_quietly(chat.id)
         await _delete_quietly(infomsg)
         raise
-    print(f"[stream] play() finished in {time.time() - _t0:.1f}s")
-    # The song is already playing. The cover and the card are built in the
-    # background, so nothing here delays the voice chat join.
-    _spawn(_announce(song, lang, chat, infomsg, _t0))
+    get_group(chat.id)["stream_started_at"] = time.time()
+    print(f"[stream] playing at {time.time() - t0:.1f}s in chat {chat.id}")
+    # The song is already playing. The cover and the card are made in the
+    # background, so nothing here delays the song.
+    _spawn(_announce(song, lang, chat, infomsg, t0))
 
 
 async def _set_title_quietly(chat_id: int, title: str) -> None:
@@ -155,7 +374,7 @@ async def _make_cover(song: Song, chat, title: str):
     for thumb in (song.thumb or DEFAULT_THUMB, DEFAULT_THUMB):
         try:
             return await generate_cover(title, chat.title, chat.id, thumb)
-        except BaseException as e:
+        except Exception as e:
             print(f"[stream] cover failed: {type(e).__name__}: {e}")
     return None
 
@@ -171,9 +390,11 @@ def _requester_html(song: Song) -> str:
 
 async def _plain_card(song: Song, lang, cover):
     """Plain Pyrogram message, used when the styled Bot API card fails."""
-    who = song.requested_by.mention if song.requested_by else (
-        song.request_msg.sender_chat.title if song.request_msg.sender_chat else ""
-    )
+    if song.requested_by:
+        who = song.requested_by.mention
+    else:
+        sender = song.request_msg.sender_chat
+        who = sender.title if sender else ""
     text = lang["playing"] % (
         song.title or "Unknown",
         song.source,
@@ -203,11 +424,11 @@ async def _announce(song: Song, lang, chat, infomsg, t0: float) -> None:
                 chat_title=chat.title or "",
             )
             message = await ui.send_now_playing(chat.id, None, caption, cover)
-        except BaseException as e:
+        except Exception as e:
             print(f"[stream] styled card failed ({type(e).__name__}: {e}), sending the plain one")
             try:
                 message = await _plain_card(song, lang, cover)
-            except BaseException as e2:
+            except Exception as e2:
                 print(f"[stream] could not send the now-playing message: {type(e2).__name__}: {e2}")
         if message is not None:
             safone[chat.id] = message
@@ -216,24 +437,3 @@ async def _announce(song: Song, lang, chat, infomsg, t0: float) -> None:
         await _delete_quietly(infomsg)
         if cover and os.path.exists(cover):
             os.remove(cover)
-
-
-def get_quality(song: Song) -> MediaStream:
-    group = get_group(song.request_msg.chat.id)
-    key = config.QUALITY.lower()
-    if key not in _AUDIO_QUALITY:
-        print("WARNING: Invalid Quality Specified. Defaulting to High!")
-        key = "high"
-    if group["stream_mode"] == "video":
-        return MediaStream(
-            song.remote,
-            _AUDIO_QUALITY[key],
-            _VIDEO_QUALITY[key],
-            headers=song.headers,
-        )
-    return MediaStream(
-        song.remote,
-        _AUDIO_QUALITY[key],
-        video_flags=MediaStream.Flags.IGNORE,
-        headers=song.headers,
-    )
