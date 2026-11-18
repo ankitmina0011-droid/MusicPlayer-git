@@ -16,6 +16,7 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>
 """
 
+import re
 import sys
 import json
 import asyncio
@@ -25,7 +26,7 @@ from datetime import timedelta
 from urllib.parse import urlparse
 from aiohttp import ClientSession
 from pyrogram.types import User, Message
-from typing import Dict, Tuple, Union, Optional
+from typing import Dict, List, Tuple, Union, Optional
 
 DEFAULT_THUMB = "https://telegra.ph/file/820cac7cb7b1a025542e2.jpg"
 
@@ -78,11 +79,14 @@ class Song:
             if not query:
                 query = await self._guess_title()
             if query:
+                query = self._clean_query(query)
                 print(f"[fallback] trying SoundCloud for {query!r}")
-                sc_video = await self._extract(f"scsearch1:{query}")
-                if sc_video and await self._playable(sc_video):
-                    await self._fill(sc_video)
-                    return (True, "PARSED")
+                # Some results are DRM protected or blocked, so try the first
+                # few matches instead of only the first one.
+                for sc_video in await self._extract_many(f"scsearch5:{query}"):
+                    if await self._playable(sc_video):
+                        await self._fill(sc_video)
+                        return (True, "PARSED")
 
         self._retries += 1
         return (False, "MAX_RETRY_LIMIT_REACHED")
@@ -120,25 +124,41 @@ class Song:
                 await session.close()
         return None
 
-    async def _extract(self, target: str) -> Optional[dict]:
+    @staticmethod
+    def _clean_query(text: str) -> str:
+        """Remove (Official Video), [4K Remaster] and similar from a title."""
+        cleaned = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", text)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned or text
+
+    async def _extract_many(self, target: str) -> List[dict]:
         # sys.executable -m yt_dlp uses the same Python environment as the bot,
         # so it works even if the yt-dlp command is not in PATH.
+        # -i keeps going when one result fails (for example DRM protected).
         process = await asyncio.create_subprocess_shell(
-            f"{quote(sys.executable)} -m yt_dlp --print-json --skip-download "
-            f"-f best {quote(target)}",
+            f"{quote(sys.executable)} -m yt_dlp -i --no-warnings --print-json "
+            f"--skip-download -f best {quote(target)}",
             stdout=PIPE,
             stderr=PIPE,
         )
         out, err = await process.communicate()
+        results = []
         for line in out.decode(errors="ignore").splitlines():
             line = line.strip()
             if line.startswith("{"):
                 try:
-                    return json.loads(line)
+                    results.append(json.loads(line))
                 except json.JSONDecodeError:
-                    break
-        print(f"[yt-dlp] failed for {target!r}:\n{err.decode(errors='ignore')[-800:]}")
-        return None
+                    pass
+        if not results:
+            print(
+                f"[yt-dlp] failed for {target!r}:\n{err.decode(errors='ignore')[-800:]}"
+            )
+        return results
+
+    async def _extract(self, target: str) -> Optional[dict]:
+        results = await self._extract_many(target)
+        return results[0] if results else None
 
     async def _playable(self, video: dict) -> bool:
         url = video.get("url")
