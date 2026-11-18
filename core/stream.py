@@ -17,6 +17,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>
 """
 
 import os
+import shutil
+import tempfile
 from config import config
 from core.song import Song
 from pyrogram import Client
@@ -29,6 +31,39 @@ from pyrogram.raw.types import InputPeerChannel
 from pytgcalls.types import AudioQuality, VideoQuality
 from pyrogram.raw.functions.phone import CreateGroupCall
 from pytgcalls.exceptions import NoActiveGroupCall
+
+
+def _ensure_ffmpeg() -> None:
+    """The voice chat library plays audio through the ffmpeg program.
+    If the server has none, the call joins but stays silent, so check it
+    and, when missing, use the copy bundled in the imageio-ffmpeg package."""
+    found = shutil.which("ffmpeg")
+    if found:
+        print(f"[ffmpeg] found: {found}")
+        return
+    try:
+        import imageio_ffmpeg
+
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        bin_dir = os.path.join(tempfile.gettempdir(), "ffmpeg-bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        link = os.path.join(bin_dir, "ffmpeg")
+        if not os.path.exists(link):
+            try:
+                os.symlink(exe, link)
+            except OSError:
+                shutil.copy(exe, link)
+                os.chmod(link, 0o755)
+        os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+        print(f"[ffmpeg] not installed, using bundled copy: {exe}")
+    except BaseException as e:
+        print(
+            f"[ffmpeg] NOT found and no bundled copy ({type(e).__name__}: {e}). "
+            "Songs will stay silent!"
+        )
+
+
+_ensure_ffmpeg()
 
 
 safone = {}
@@ -56,6 +91,7 @@ async def start_stream(song: Song, lang):
         except BaseException:
             pass
     infomsg = await song.request_msg.reply_text(lang["downloading"])
+    print(f"[stream] starting {song.title!r} in chat {chat.id}")
     try:
         await pytgcalls.play(
             chat.id,
