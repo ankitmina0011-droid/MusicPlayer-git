@@ -32,7 +32,10 @@ from pytgcalls import PyTgCalls
 from core.funcs import generate_cover
 from core.groups import get_group, set_group, set_title
 from pytgcalls.types.stream import MediaStream
-from pyrogram.raw.types import InputPeerChannel
+from pyrogram.handlers import RawUpdateHandler
+from pyrogram.raw.types import InputPeerChannel, InputChannel
+from pyrogram.raw.types import UpdateGroupCall, UpdateGroupCallParticipants
+from pyrogram.raw.functions.channels import GetFullChannel
 from pytgcalls.types import AudioQuality, VideoQuality
 from pyrogram.raw.functions.phone import CreateGroupCall
 from pytgcalls.exceptions import NoActiveGroupCall
@@ -103,6 +106,7 @@ NOTICES = {
     "not_in_group": "❌ Music account is not in this group. Add it to the group, give it admin rights with Manage video chats, then send /play again.",
     "admin_required": "❌ Music account needs admin rights with Manage video chats in this group.",
     "not_found": "❌ Song not found or could not be played. Try another name or link.",
+    "video_needs_reply": "🎬 Video plays only when /vplay replies to a video message. This one plays as audio.",
 }
 
 # Silence is played while the song is still downloading. It is long enough
@@ -111,6 +115,8 @@ SILENCE_PATH = os.path.abspath("silence.wav")
 
 # Chats where the music account is already inside a voice chat.
 _IN_CALL = set()
+# When the music account last joined each voice chat (see the VC notices below).
+_JOINED_AT = {}
 # Chats whose stream is being replaced right now (see _switch).
 _SWITCHING = set()
 
@@ -183,7 +189,9 @@ def _media(path: str, headers=None, video: bool = False) -> MediaStream:
 
 
 def get_quality(song: Song) -> MediaStream:
-    video = get_group(song.request_msg.chat.id)["stream_mode"] == "video"
+    # /vplay sets song.video for that one song, so /play after /vplay is audio again.
+    # The /mode switch of the group still turns video on for every song.
+    video = bool(getattr(song, "video", False)) or get_group(song.request_msg.chat.id)["stream_mode"] == "video"
     return _media(song.remote, song.headers, video)
 
 
@@ -200,9 +208,28 @@ async def _create_group_call(chat_id: int) -> None:
     )
 
 
+_PEERS_LOADED = False
+
+
+async def _load_peers() -> None:
+    """The music account keeps its list of chats in memory only, so after every
+    restart a group it is already in is unknown until its dialogs are read."""
+    global _PEERS_LOADED
+    if _PEERS_LOADED:
+        return
+    _PEERS_LOADED = True
+    try:
+        async for _ in app.get_dialogs():
+            pass
+        print("[userbot] dialogs read, known chats are loaded")
+    except Exception as e:
+        print(f"[userbot] could not read the dialogs: {type(e).__name__}: {e}")
+
+
 async def _ensure_userbot_in_chat(chat_id: int) -> bool:
     """Make sure the music account is in the group. If it is not, join it with
     an invite link made by the bot (the bot must be an admin with invite rights)."""
+    await _load_peers()
     try:
         await app.get_chat_member(chat_id, "me")
         return True
@@ -214,6 +241,8 @@ async def _ensure_userbot_in_chat(chat_id: int) -> bool:
         print(f"[userbot] joined chat {chat_id} with an invite link")
         return True
     except Exception as e:
+        if _is_error(e, "USER_ALREADY_PARTICIPANT"):
+            return True
         print(f"[userbot] could not join chat {chat_id}: {type(e).__name__}: {e}")
         return False
 
@@ -236,13 +265,17 @@ async def _play(chat, stream: MediaStream) -> None:
             try:
                 await pytgcalls.play(chat.id, stream)
                 _IN_CALL.add(chat.id)
+                _JOINED_AT[chat.id] = time.time()
                 return
             except NoActiveGroupCall:
                 await _create_group_call(chat.id)
         except Exception as e:
             if type(e).__name__ == "AlreadyJoinedError":
                 await _leave_quietly(chat.id)
-            elif _is_error(e, "CHANNEL_PRIVATE", "USER_NOT_PARTICIPANT", "PEER_ID_INVALID"):
+            elif _is_error(
+                e, "CHANNEL_PRIVATE", "CHANNEL_INVALID", "USER_NOT_PARTICIPANT",
+                "PEER_ID_INVALID", "ID not found",
+            ):
                 if fixed or not await _ensure_userbot_in_chat(chat.id):
                     raise UserbotError("not_in_group") from e
                 fixed = True
@@ -437,3 +470,138 @@ async def _announce(song: Song, lang, chat, infomsg, t0: float) -> None:
         await _delete_quietly(infomsg)
         if cover and os.path.exists(cover):
             os.remove(cover)
+
+
+# --- Voice chat join and leave notices ---------------------------------------
+# Telegram tells the music account when someone joins or leaves the voice chat
+# it is in. The bot then posts "VC JOIN" or "VC LEFT" with the person's name,
+# user ID and username, and deletes that message after VC_NOTICE_SECONDS.
+VC_NOTICE_SECONDS = 5
+# Right after the music account joins, Telegram lists the people already inside.
+# Those are remembered but not announced.
+VC_SNAPSHOT_SECONDS = 4
+_CALL_CHATS = {}  # group call id -> chat id
+_VC_STATE = {}  # (chat id, user id) -> ("JOIN" or "LEFT", time it was seen)
+
+
+def _marked_chat_id(chat_id: int) -> int:
+    """Some updates carry a bare channel id. The bot uses the -100 form."""
+    return chat_id if chat_id < 0 else int("-100" + str(chat_id))
+
+
+async def _chat_of_call(call_id: int):
+    if call_id in _CALL_CHATS:
+        return _CALL_CHATS[call_id]
+    # The call is not known yet: ask each chat where the music account is in a call.
+    for chat_id in list(_IN_CALL):
+        try:
+            peer = await app.resolve_peer(chat_id)
+            full = await app.invoke(
+                GetFullChannel(
+                    channel=InputChannel(
+                        channel_id=peer.channel_id, access_hash=peer.access_hash
+                    )
+                )
+            )
+        except Exception:
+            continue
+        call = getattr(full.full_chat, "call", None)
+        if call is not None:
+            _CALL_CHATS[call.id] = chat_id
+            if call.id == call_id:
+                return chat_id
+    return None
+
+
+async def _user_details(user_id: int, users: dict):
+    user = users.get(user_id)
+    if user is None:
+        try:
+            user = await app.get_users(user_id)
+        except Exception:
+            user = None
+    parts = [getattr(user, "first_name", None) or "", getattr(user, "last_name", None) or ""]
+    name = " ".join(part for part in parts if part) or "Unknown"
+    return name, getattr(user, "username", None) or ""
+
+
+async def _vc_notice(chat_id: int, status: str, user_id: int, name: str, username: str) -> None:
+    heading = "🟢 VC JOIN" if status == "JOIN" else "🔴 VC LEFT"
+    handle = "@" + escape(username) if username else "None"
+    text = (
+        f"<b>{heading}</b>\n"
+        f"Name: {escape(name)}\n"
+        f"User ID: <code>{user_id}</code>\n"
+        f"Username: {handle}"
+    )
+    try:
+        result = await ui.call(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+                "disable_notification": True,
+            },
+        )
+    except Exception as e:
+        print(f"[vc] could not send the notice: {type(e).__name__}: {e}")
+        return
+    await asyncio.sleep(VC_NOTICE_SECONDS)
+    try:
+        await ui.call(
+            "deleteMessage", {"chat_id": chat_id, "message_id": result["message_id"]}
+        )
+    except Exception:
+        pass
+
+
+async def _vc_participants(update, users: dict) -> None:
+    try:
+        chat_id = await _chat_of_call(update.call.id)
+        if chat_id is None:
+            return
+        users = users or {}
+        me = getattr(app, "me", None)
+        my_id = me.id if me else None
+        for participant in update.participants:
+            user_id = getattr(getattr(participant, "peer", None), "user_id", None)
+            if not user_id or user_id == my_id:
+                continue
+            key = (chat_id, user_id)
+            before, when = _VC_STATE.get(key, ("", 0.0))
+            now = time.time()
+            if now - _JOINED_AT.get(chat_id, 0.0) < VC_SNAPSHOT_SECONDS:
+                _VC_STATE[key] = ("LEFT" if getattr(participant, "left", False) else "JOIN", now)
+                continue
+            if getattr(participant, "left", False):
+                if before == "LEFT":
+                    continue
+                status = "LEFT"
+            elif getattr(participant, "just_joined", False) or before == "LEFT":
+                if before == "JOIN" and now - when < 10:
+                    continue  # the same join, sent again
+                status = "JOIN"
+            else:
+                _VC_STATE[key] = ("JOIN", now)  # already inside, nothing new
+                continue
+            _VC_STATE[key] = (status, now)
+            name, username = await _user_details(user_id, users)
+            _spawn(_vc_notice(chat_id, status, user_id, name, username))
+    except Exception as e:
+        print(f"[vc] could not handle a participant update: {type(e).__name__}: {e}")
+
+
+async def _on_raw_update(client, update, users, chats) -> None:
+    if isinstance(update, UpdateGroupCall):
+        call_id = getattr(getattr(update, "call", None), "id", None)
+        chat_id = getattr(update, "chat_id", None)
+        if call_id and chat_id:
+            _CALL_CHATS[call_id] = _marked_chat_id(chat_id)
+    elif isinstance(update, UpdateGroupCallParticipants):
+        _spawn(_vc_participants(update, users))
+
+
+# Group 10 so this handler does not take updates away from py-tgcalls.
+app.add_handler(RawUpdateHandler(_on_raw_update), group=10)
